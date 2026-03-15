@@ -309,7 +309,7 @@ The committed repo is designed to keep these private:
 
 Only placeholder templates are committed. If you share the working directory manually instead of pushing through git, you still need to exclude the private local files and generated artifacts listed above.
 
-## 🚀 Future Roadmap: Sub-4-Minute Scans
+## Future Roadmap: Sub-4-Minute Scans
 
 The current 25-minute runtime is primarily limited by the aggressive rate-limiting required for scraping external data providers. To reduce the runtime to **under 4 minutes**, the following architecture is planned:
 
