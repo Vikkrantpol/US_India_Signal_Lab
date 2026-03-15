@@ -4,6 +4,19 @@ Open-source shell-driven market scanner workspace for US equities and India NSE 
 
 This repository is structured so the code can be public while the proprietary scan thresholds and broker credentials stay local-only.
 
+## 📸 Preview
+
+![Dashboard Overview](doc/screenshots/dashboard_main.png)
+*Modern, IDE-like full-screen dashboard with Control Center and terminal output.*
+
+<p align="center">
+  <img src="doc/screenshots/terminal_scan.png" width="45%" alt="Terminal Scan Output" />
+  <img src="doc/screenshots/scanner_report.png" width="45%" alt="Scanner Report View" />
+</p>
+<p align="center">
+  <em>Live terminal momentum scanning and polished report summaries.</em>
+</p>
+
 ## What This Project Includes
 
 - US scanner with resume/fresh workflows, reports, diffs, history, sector views, exports, and daily automation helpers
@@ -295,3 +308,19 @@ The committed repo is designed to keep these private:
 - real scan thresholds
 
 Only placeholder templates are committed. If you share the working directory manually instead of pushing through git, you still need to exclude the private local files and generated artifacts listed above.
+
+## 🚀 Future Roadmap: Sub-4-Minute Scans
+
+The current 25-minute runtime is primarily limited by the aggressive rate-limiting required for scraping external data providers. To reduce the runtime to **under 4 minutes**, the following architecture is planned:
+
+### 1. Hybrid Scan Architecture
+- **Hard Scan (Weekly)**: Performs full yFinance `.info` lookups for fundamentals (PE, Growth, Margins). These are stored in a local `fundamental_cache`.
+- **Cached Scan (Daily)**: Merges the cached fundamentals with live price data from the Broker API.
+
+### 2. Broker API Integration
+- **Direct Quotes**: Using Fyers (India) and high-speed US broker APIs to fetch CMP, volume, and 52-week proximity data in bulk.
+- **Bulk Requests**: Sending batches of 50-100 symbols per API call to eliminate per-ticker loop latency.
+
+### 3. Optimized Latency
+- **Minimized Sleep**: Transitioning from 1-3 second per-ticker delays to 1-2 second per-chunk pauses.
+- **Concurrent Processing**: Leveraging asynchronous I/O and bulk history downloads for technical indicator calculations (EMAs, RSI).
