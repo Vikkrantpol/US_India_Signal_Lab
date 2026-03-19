@@ -85,8 +85,8 @@ Those generated files can reveal strategy behavior even if the source code is cl
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/Vikkrantpol/us-india-signal-lab.git
-cd us-india-signal-lab
+git clone https://github.com/Vikkrantpol/US_India_Signal_Lab.git
+cd US_India_Signal_Lab
 ```
 
 ### 2. Create the private scan conditions file
