@@ -1,4 +1,4 @@
-# US + India Signal Scanner
+# US-India Signal Lab
 
 Open-source shell-driven market scanner workspace for US equities and India NSE equities, with local history, archived reports, diff views, and a browser dashboard.
 
@@ -85,8 +85,8 @@ Those generated files can reveal strategy behavior even if the source code is cl
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/Vikkrantpol/US_IN_NEW_SCANNER_NEW_FEATURES.git
-cd US_IN_NEW_SCANNER_NEW_FEATURES
+git clone https://github.com/Vikkrantpol/us-india-signal-lab.git
+cd us-india-signal-lab
 ```
 
 ### 2. Create the private scan conditions file
