@@ -878,8 +878,16 @@ def process_ticker(symbol):
 #  STEP 6 — MAIN SCAN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 total_chunks = len(chunks)
-run_id = state_store.start_run(run_date=RUN_DATE)
-archive_run_id = archive_store.start_run(run_date=RUN_DATE)
+try:
+    run_id = state_store.start_run(run_date=RUN_DATE)
+except Exception as exc:
+    safe_print(f"  ⚠  state run start failed ({exc})")
+    run_id = None
+try:
+    archive_run_id = archive_store.start_run(run_date=RUN_DATE)
+except Exception as exc:
+    safe_print(f"  ⚠  archive run start failed ({exc})")
+    archive_run_id = None
 
 for chunk_num, chunk in enumerate(chunks):
     print(format_chunk_header(chunk_num + 1, total_chunks))
@@ -909,19 +917,28 @@ for chunk_num, chunk in enumerate(chunks):
         print(format_sleep_line(CHUNK_PAUSE))
         time.sleep(CHUNK_PAUSE)
 
-save_daily_snapshot(OUTPUT_JSON)
-state_store.finish_run(
-    run_id,
-    status='completed',
-    total_scanned=len(scanned),
-    total_results=len(results),
-)
-archive_store.finish_run(
-    archive_run_id,
-    status='completed',
-    total_scanned=len(scanned),
-    total_results=len(results),
-)
+try:
+    save_daily_snapshot(OUTPUT_JSON)
+except Exception as exc:
+    safe_print(f"  ⚠  snapshot save failed ({exc})")
+try:
+    state_store.finish_run(
+        run_id,
+        status='completed',
+        total_scanned=len(scanned),
+        total_results=len(results),
+    )
+except Exception as exc:
+    safe_print(f"  ⚠  state run finalization failed ({exc})")
+try:
+    archive_store.finish_run(
+        archive_run_id,
+        status='completed',
+        total_scanned=len(scanned),
+        total_results=len(results),
+    )
+except Exception as exc:
+    safe_print(f"  ⚠  archive run finalization failed ({exc})")
 
 # ── Final ─────────────────────────────────────────────────────────────────────
 print(f"\n{'='*65}")

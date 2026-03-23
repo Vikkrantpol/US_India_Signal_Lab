@@ -23,9 +23,11 @@ india_results.json
 india_results_*.json
 scan_state.db
 scan_state.db-*
+scan_state.db.corrupt-*
 scan_state*.db
 scan_mega_history.db
 scan_mega_history.db-*
+scan_mega_history.db.corrupt-*
 scan_mega_history*.db
 scanner_scanned.txt
 india_scanned.txt

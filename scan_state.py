@@ -5,29 +5,178 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Lock
+from threading import RLock
+
+
+SQLITE_CORRUPTION_MARKERS = (
+    "database disk image is malformed",
+    "file is not a database",
+    "malformed database schema",
+    "database corrupt",
+    "rowid out of order",
+    "missing from index",
+    "wrong # of entries in index",
+)
 
 
 class ScanStateStore:
     def __init__(self, db_path, market, log_date_format="%Y-%m-%d"):
-        self.db_path = db_path
+        self.db_path = str(db_path)
         self.market = market
         self.log_date_format = log_date_format
-        self.lock = Lock()
-        self.conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+        self.lock = RLock()
+        self.conn = None
+        with self.lock:
+            self._open_and_prepare_locked(initializing=True)
+
+    def _log(self, message):
+        print(f"⚠ ScanStateStore[{self.market}] {message}", file=sys.stderr)
+
+    def _open_connection_locked(self):
+        self.conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+
+    def _close_connection_locked(self):
+        if self.conn is None:
+            return
+        try:
+            try:
+                self.conn.execute("PRAGMA optimize")
+            except sqlite3.DatabaseError:
+                pass
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.DatabaseError:
+                pass
+        finally:
+            self.conn.close()
+            self.conn = None
+
+    def _db_related_paths(self, db_path=None):
+        base = Path(db_path or self.db_path)
+        return [base, Path(f"{base}-wal"), Path(f"{base}-shm")]
+
+    def _remove_db_files_locked(self, db_path=None):
+        for candidate in self._db_related_paths(db_path=db_path):
+            if candidate.exists():
+                candidate.unlink()
+
+    def _is_corruption_error(self, exc):
+        if not isinstance(exc, sqlite3.DatabaseError):
+            return False
+        message = str(exc).lower()
+        return any(marker in message for marker in SQLITE_CORRUPTION_MARKERS)
+
+    def _validate_connection_locked(self, pragma="quick_check"):
+        rows = self.conn.execute(f"PRAGMA {pragma}").fetchall()
+        messages = [str(row[0]) for row in rows if row and row[0] is not None]
+        if not messages or messages == ["ok"]:
+            return
+        raise sqlite3.DatabaseError("; ".join(messages[:10]))
+
+    def _recover_from_backup_locked(self, source_db, target_db):
+        try:
+            recovered = subprocess.run(
+                ["sqlite3", str(source_db), ".recover --ignore-freelist"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return False
+        if recovered.returncode != 0 or not recovered.stdout.strip():
+            return False
+        imported = subprocess.run(
+            ["sqlite3", str(target_db)],
+            input=recovered.stdout,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return imported.returncode == 0
+
+    def _recover_database_locked(self, reason):
+        self._close_connection_locked()
+
+        base = Path(self.db_path)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        quarantined_db = base.with_name(f"{base.name}.corrupt-{stamp}")
+        for source, target in zip(self._db_related_paths(), self._db_related_paths(quarantined_db)):
+            if source.exists():
+                os.replace(source, target)
+
+        restored = quarantined_db.exists() and self._recover_from_backup_locked(quarantined_db, base)
+        if restored:
+            self._log(f"Recovered {base.name} after {reason}. Corrupt copy kept at {quarantined_db}")
+        else:
+            self._remove_db_files_locked(db_path=base)
+            self._log(f"Recreated clean {base.name} after {reason}. Corrupt copy kept at {quarantined_db}")
+
+        self._open_connection_locked()
         self._configure()
         self._init_schema()
+        try:
+            self._validate_connection_locked(pragma="quick_check")
+        except sqlite3.DatabaseError as exc:
+            self._close_connection_locked()
+            self._remove_db_files_locked(db_path=base)
+            self._open_connection_locked()
+            self._configure()
+            self._init_schema()
+            self._log(
+                f"Recovered database did not pass health check ({exc}); started with a clean {base.name}"
+            )
+
+    def _open_and_prepare_locked(self, initializing=False):
+        self._open_connection_locked()
+        try:
+            self._configure()
+            self._validate_connection_locked(pragma="quick_check")
+            self._init_schema()
+        except sqlite3.DatabaseError as exc:
+            if not self._is_corruption_error(exc):
+                self._close_connection_locked()
+                raise
+            phase = "startup" if initializing else "reconnect"
+            self._log(f"{phase} integrity failure in {self.db_path}: {exc}")
+            self._recover_database_locked(reason=f"{phase}: {exc}")
+
+    def _ensure_connection_locked(self):
+        if self.conn is None:
+            self._open_and_prepare_locked(initializing=False)
+
+    def _run_db_operation(self, action, callback):
+        with self.lock:
+            self._ensure_connection_locked()
+            try:
+                return callback()
+            except sqlite3.DatabaseError as exc:
+                if not self._is_corruption_error(exc):
+                    raise
+                self._log(f"{action} hit corruption in {self.db_path}: {exc}")
+                self._recover_database_locked(reason=f"{action}: {exc}")
+                return callback()
+
+    def _resolve_run_id_locked(self, run_id):
+        if run_id is None:
+            return None
+        row = self.conn.execute(
+            "SELECT 1 FROM scan_runs WHERE id = ? AND market = ? LIMIT 1",
+            (run_id, self.market),
+        ).fetchone()
+        return run_id if row is not None else None
 
     def _configure(self):
         with self.conn:
             self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA synchronous=FULL")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA busy_timeout=30000")
+            self.conn.execute("PRAGMA wal_autocheckpoint=1000")
 
     def _init_schema(self):
         with self.conn:
@@ -376,10 +525,7 @@ class ScanStateStore:
 
     def close(self):
         with self.lock:
-            if self.conn is None:
-                return
-            self.conn.close()
-            self.conn = None
+            self._close_connection_locked()
 
     def parse_scan_date(self, value):
         if not value:
@@ -425,15 +571,17 @@ class ScanStateStore:
         return str(scan_date)
 
     def has_market_state(self):
-        with self.lock:
+        def op():
             row = self.conn.execute(
                 "SELECT 1 FROM latest_scan_state WHERE market = ? LIMIT 1",
                 (self.market,),
             ).fetchone()
-        return row is not None
+            return row is not None
+
+        return self._run_db_operation("has_market_state", op)
 
     def load_latest_state(self):
-        with self.lock:
+        def op():
             rows = self.conn.execute(
                 """
                 SELECT ticker, score, failed, scan_date
@@ -442,7 +590,9 @@ class ScanStateStore:
                 """,
                 (self.market,),
             ).fetchall()
+            return rows
 
+        rows = self._run_db_operation("load_latest_state", op)
         history = {}
         for row in rows:
             history[row["ticker"]] = {
@@ -454,15 +604,17 @@ class ScanStateStore:
         return history
 
     def has_market_history(self):
-        with self.lock:
+        def op():
             row = self.conn.execute(
                 "SELECT 1 FROM scan_history WHERE market = ? LIMIT 1",
                 (self.market,),
             ).fetchone()
-        return row is not None
+            return row is not None
+
+        return self._run_db_operation("has_market_history", op)
 
     def load_history_rows(self):
-        with self.lock:
+        def op():
             rows = self.conn.execute(
                 """
                 SELECT ticker, score, failed, scan_date, scanned_at, payload_json, source
@@ -472,10 +624,12 @@ class ScanStateStore:
                 """,
                 (self.market,),
             ).fetchall()
-        return [dict(row) for row in rows]
+            return [dict(row) for row in rows]
+
+        return self._run_db_operation("load_history_rows", op)
 
     def summarize_market_history(self, event_limit=10, run_limit=5, snapshot_limit=5, ticker_limit=10):
-        with self.lock:
+        def op():
             totals = self.conn.execute(
                 """
                 SELECT
@@ -530,7 +684,12 @@ class ScanStateStore:
                 """,
                 (self.market, snapshot_limit),
             ).fetchall()
+            return totals, recent_runs, recent_events, top_tickers, recent_snapshots
 
+        totals, recent_runs, recent_events, top_tickers, recent_snapshots = self._run_db_operation(
+            "summarize_market_history",
+            op,
+        )
         return {
             "market": self.market,
             "db_path": self.db_path,
@@ -557,7 +716,7 @@ class ScanStateStore:
 
     def start_run(self, run_date):
         started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self.lock:
+        def op():
             cursor = self.conn.execute(
                 """
                 INSERT INTO scan_runs (market, run_date, started_at, status)
@@ -568,10 +727,15 @@ class ScanStateStore:
             self.conn.commit()
             return cursor.lastrowid
 
+        return self._run_db_operation("start_run", op)
+
     def finish_run(self, run_id, status="completed", total_scanned=None, total_results=None):
         completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self.lock:
-            self.conn.execute(
+        def op():
+            resolved_run_id = self._resolve_run_id_locked(run_id)
+            if resolved_run_id is None:
+                return False
+            cursor = self.conn.execute(
                 """
                 UPDATE scan_runs
                 SET completed_at = ?,
@@ -580,16 +744,20 @@ class ScanStateStore:
                     total_results = ?
                 WHERE id = ?
                 """,
-                (completed_at, status, total_scanned, total_results, run_id),
+                (completed_at, status, total_scanned, total_results, resolved_run_id),
             )
             self.conn.commit()
+            return cursor.rowcount > 0
+
+        return self._run_db_operation("finish_run", op)
 
     def record_scan(self, ticker, score=0, failed="", run_id=None, scan_date=None, scanned_at=None, source="runtime", payload=None):
         scan_date_text = self._scan_date_to_text(scan_date)
         scanned_at_text = scanned_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         payload_json = self._serialize_payload(payload)
 
-        with self.lock:
+        def op():
+            resolved_run_id = self._resolve_run_id_locked(run_id)
             self.conn.execute(
                 """
                 INSERT INTO scan_history (
@@ -605,7 +773,7 @@ class ScanStateStore:
                     scan_date_text,
                     scanned_at_text,
                     payload_json,
-                    run_id,
+                    resolved_run_id,
                     source,
                 ),
             )
@@ -632,15 +800,18 @@ class ScanStateStore:
                     scan_date_text,
                     scanned_at_text,
                     payload_json,
-                    run_id,
+                    resolved_run_id,
                     source,
                 ),
             )
             self.conn.commit()
 
+        self._run_db_operation("record_scan", op)
+
     def record_snapshot(self, snapshot_date, file_path, run_id=None):
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self.lock:
+        def op():
+            resolved_run_id = self._resolve_run_id_locked(run_id)
             self.conn.execute(
                 """
                 INSERT INTO scan_snapshots (market, snapshot_date, file_path, created_at, run_id)
@@ -650,14 +821,16 @@ class ScanStateStore:
                     created_at = excluded.created_at,
                     run_id = excluded.run_id
                 """,
-                (self.market, snapshot_date, file_path, created_at, run_id),
+                (self.market, snapshot_date, file_path, created_at, resolved_run_id),
             )
             self.conn.commit()
+
+        self._run_db_operation("record_snapshot", op)
 
     def record_artifact(self, artifact_type, payload, scan_generated_at=None, source_file=None, reference_file=None, reference_date=None):
         generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         payload_json = self._serialize_payload(payload) or "{}"
-        with self.lock:
+        def op():
             if artifact_type == "diff":
                 existing = self.conn.execute(
                     """
@@ -727,13 +900,15 @@ class ScanStateStore:
             self.conn.commit()
             return cursor.lastrowid
 
+        return self._run_db_operation("record_artifact", op)
+
     def record_command_output(self, command_name, payload, market=None, scan_generated_at=None, source_file=None, reference_file=None, reference_date=None, legacy_artifact_id=None):
         generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         payload_json = self._serialize_payload(payload) or "{}"
         table_name = self._command_archive_table(market=market)
         if not table_name:
             return None
-        with self.lock:
+        def op():
             if command_name == "diff":
                 existing = self.conn.execute(
                     f"""
@@ -803,6 +978,8 @@ class ScanStateStore:
             self.conn.commit()
             return cursor.lastrowid
 
+        return self._run_db_operation("record_command_output", op)
+
     def _insert_report_history_row(self, market, payload, source_file=None, command_archive_id=None, generated_at=None, scan_generated_at=None):
         table_name = self._report_history_table(market=market)
         if not table_name or not isinstance(payload, dict):
@@ -837,7 +1014,7 @@ class ScanStateStore:
         return cursor.lastrowid
 
     def record_report_history(self, market, payload, source_file=None, command_archive_id=None, generated_at=None, scan_generated_at=None):
-        with self.lock:
+        def op():
             row_id = self._insert_report_history_row(
                 market=market,
                 payload=payload,
@@ -848,6 +1025,8 @@ class ScanStateStore:
             )
             self.conn.commit()
             return row_id
+
+        return self._run_db_operation("record_report_history", op)
 
     def _insert_sector_history_rows(self, market, payload, source_file=None, command_archive_id=None, generated_at=None, scan_generated_at=None):
         table_name = self._sector_history_table(market=market)
@@ -895,7 +1074,7 @@ class ScanStateStore:
         return inserted
 
     def record_sector_history(self, market, payload, source_file=None, command_archive_id=None, generated_at=None, scan_generated_at=None):
-        with self.lock:
+        def op():
             inserted = self._insert_sector_history_rows(
                 market=market,
                 payload=payload,
@@ -907,80 +1086,84 @@ class ScanStateStore:
             self.conn.commit()
             return inserted
 
+        return self._run_db_operation("record_sector_history", op)
+
     def migrate_legacy_log(self, legacy_path):
         if not legacy_path or not os.path.exists(legacy_path) or self.has_market_state():
             return {"migrated": False, "entries": 0, "tickers": 0}
 
-        migrated_entries = 0
-        migrated_tickers = set()
-        base_datetime = datetime(1970, 1, 1, 0, 0, 0)
+        def op():
+            migrated_entries = 0
+            migrated_tickers = set()
+            base_datetime = datetime(1970, 1, 1, 0, 0, 0)
 
-        with open(legacy_path) as handle, self.lock:
-            for line_number, line in enumerate(handle, start=1):
-                entry = self.parse_scan_entry(line)
-                if not entry:
-                    continue
+            with open(legacy_path) as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    entry = self.parse_scan_entry(line)
+                    if not entry:
+                        continue
 
-                scan_date_text = self._scan_date_to_text(entry["date"])
-                if scan_date_text:
-                    scanned_dt = datetime.strptime(scan_date_text, self.log_date_format)
-                else:
-                    scanned_dt = base_datetime
-                scanned_at_text = (scanned_dt + timedelta(seconds=line_number)).strftime("%Y-%m-%d %H:%M:%S")
+                    scan_date_text = self._scan_date_to_text(entry["date"])
+                    if scan_date_text:
+                        scanned_dt = datetime.strptime(scan_date_text, self.log_date_format)
+                    else:
+                        scanned_dt = base_datetime
+                    scanned_at_text = (scanned_dt + timedelta(seconds=line_number)).strftime("%Y-%m-%d %H:%M:%S")
 
-                self.conn.execute(
-                    """
-                    INSERT INTO scan_history (
-                        market, ticker, score, failed, scan_date, scanned_at, payload_json, run_id, source
+                    self.conn.execute(
+                        """
+                        INSERT INTO scan_history (
+                            market, ticker, score, failed, scan_date, scanned_at, payload_json, run_id, source
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'legacy')
+                        """,
+                        (
+                            self.market,
+                            entry["ticker"],
+                            entry["score"],
+                            entry["failed"] or "",
+                            scan_date_text,
+                            scanned_at_text,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'legacy')
-                    """,
-                    (
-                        self.market,
-                        entry["ticker"],
-                        entry["score"],
-                        entry["failed"] or "",
-                        scan_date_text,
-                        scanned_at_text,
-                    ),
-                )
-                self.conn.execute(
-                    """
-                    INSERT INTO latest_scan_state (
-                        market, ticker, score, failed, scan_date, scanned_at, payload_json, run_id, source
+                    self.conn.execute(
+                        """
+                        INSERT INTO latest_scan_state (
+                            market, ticker, score, failed, scan_date, scanned_at, payload_json, run_id, source
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'legacy')
+                        ON CONFLICT(market, ticker) DO UPDATE SET
+                            score = excluded.score,
+                            failed = excluded.failed,
+                            scan_date = excluded.scan_date,
+                            scanned_at = excluded.scanned_at,
+                            payload_json = excluded.payload_json,
+                            run_id = excluded.run_id,
+                            source = excluded.source
+                        """,
+                        (
+                            self.market,
+                            entry["ticker"],
+                            entry["score"],
+                            entry["failed"] or "",
+                            scan_date_text,
+                            scanned_at_text,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'legacy')
-                    ON CONFLICT(market, ticker) DO UPDATE SET
-                        score = excluded.score,
-                        failed = excluded.failed,
-                        scan_date = excluded.scan_date,
-                        scanned_at = excluded.scanned_at,
-                        payload_json = excluded.payload_json,
-                        run_id = excluded.run_id,
-                        source = excluded.source
-                    """,
-                    (
-                        self.market,
-                        entry["ticker"],
-                        entry["score"],
-                        entry["failed"] or "",
-                        scan_date_text,
-                        scanned_at_text,
-                    ),
-                )
-                migrated_entries += 1
-                migrated_tickers.add(entry["ticker"])
+                    migrated_entries += 1
+                    migrated_tickers.add(entry["ticker"])
 
             self.conn.commit()
+            return {
+                "migrated": migrated_entries > 0,
+                "entries": migrated_entries,
+                "tickers": len(migrated_tickers),
+            }
 
-        return {
-            "migrated": migrated_entries > 0,
-            "entries": migrated_entries,
-            "tickers": len(migrated_tickers),
-        }
+        return self._run_db_operation("migrate_legacy_log", op)
 
     def reset_market(self):
-        with self.lock:
+        def op():
             counts = {
                 "latest_scan_state": self.conn.execute(
                     "SELECT COUNT(*) FROM latest_scan_state WHERE market = ?",
@@ -1027,10 +1210,12 @@ class ScanStateStore:
             if table_name:
                 self.conn.execute(f"DELETE FROM {table_name}")
             self.conn.commit()
-        return counts
+            return counts
+
+        return self._run_db_operation("reset_market", op)
 
     def has_any_data(self):
-        with self.lock:
+        def op():
             for table_name in (
                 "latest_scan_state",
                 "scan_history",
@@ -1048,7 +1233,9 @@ class ScanStateStore:
                 row = self.conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
                 if row is not None:
                     return True
-        return False
+            return False
+
+        return self._run_db_operation("has_any_data", op)
 
 
 def _delete_sqlite_files(db_path):
